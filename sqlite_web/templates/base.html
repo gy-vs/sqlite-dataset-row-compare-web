@@ -71,6 +71,7 @@
           </div>
         {% endif %}
         <a class="btn btn-sm btn-secondary ml-1" href="{{ url_for('generic_query') }}">Query</a>
+        <a class="btn btn-sm btn-outline-light ml-1" href="{{ url_for('compare') }}">Compare</a>
         {% if datasets|length() > 1 and (enable_load or enable_filesystem) %}
           <a class="btn btn-sm btn-danger" href="{{ url_for('unload', dataset=dataset.filename) }}" style="margin-left: 3px;">Unload Database</a>
         {% endif %}

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from urllib.parse import urlencode
 from collections import namedtuple, OrderedDict
 from functools import reduce
 from functools import wraps
@@ -85,6 +86,13 @@ except ImportError:
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
 
+try:
+    from sqlite_web.compare import (
+        CompareError, Comparison, type_name, values_equal)
+except ImportError:
+    from compare import (
+        CompareError, Comparison, type_name, values_equal)
+
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
 DEBUG = False
@@ -92,6 +100,7 @@ DEBUG = False
 BLOB_AS_BASE64 = False  # Default is hex.
 ROWS_PER_PAGE = 50
 QUERY_ROWS_PER_PAGE = 1000
+COMPARE_ROWS_PER_PAGE = 50
 TRUNCATE_VALUES = True
 SECRET_KEY = 'sqlite-database-browser-0.1.0'
 SESSION_COOKIE_NAME = 'sqlite_web_session'
@@ -498,6 +507,94 @@ def unload():
 
     return render_template('unload.html', selected=dataset)
 
+def _resolve_focus(dataset, sql, args, page, rpp):
+    """
+    Land on the page of the row named by ?focus=<rowkey>&focus_cols=a,b.
+
+    Returns the encoded rowkey when the row is present on the current page
+    (the template marks and scrolls to it), or redirects to the page that
+    contains it. A row that cannot be found reports it and drops the focus.
+    """
+    def give_up(message):
+        flash(message, 'warning')
+        return None
+
+    token = args.get('focus') or ''
+    try:
+        wanted = key_decode(token)
+    except Exception:
+        return give_up('Could not read the row to locate.')
+    if not wanted:
+        return give_up('Could not read the row to locate.')
+    cols = [c for c in (args.get('focus_cols') or '').split(',') if c]
+    if not cols or len(cols) != len(wanted):
+        return give_up('The row-to-locate reference is malformed.')
+
+    if args.get('focused') == '1':
+        # We already redirected to the page; mark the row without scanning
+        # the whole result again.
+        return token if _focus_on_page(dataset, sql, cols, wanted, page,
+                                       rpp) else None
+
+    # First hop: scan the ordered result once to find the row's ordinal.
+    try:
+        cursor = dataset.query(wrap(sql))
+        result_cols = [d[0] for d in cursor.description]
+    except Exception:
+        return None
+    missing = [c for c in cols if c not in result_cols]
+    if missing:
+        return give_up('The row-to-locate columns are no longer in this '
+                       'query: %s.' % ', '.join(missing))
+    positions = [result_cols.index(c) for c in cols]
+    ordinal = 0
+    found = False
+    while True:
+        batch = cursor.fetchmany(1000)
+        if not batch:
+            break
+        for row in batch:
+            key_values = [
+                bytes(v) if isinstance(v, memoryview) else v
+                for v in (row[p] for p in positions)]
+            if len(key_values) == len(wanted) and all(
+                    values_equal(a, b) for a, b in zip(key_values, wanted)):
+                found = True
+                break
+            ordinal += 1
+        if found:
+            break
+    if not found:
+        return give_up('That row is not present in the current results.')
+
+    target_page = ordinal // rpp + 1
+    if target_page != page:
+        params = [(k, v) for k, v in args.items(multi=True)
+                  if k not in ('page', 'focused')]
+        params.append(('page', str(target_page)))
+        params.append(('focused', '1'))
+        target = request.path + '?' + urlencode(params)
+        return redirect(target)
+    return token
+
+
+def _focus_on_page(dataset, sql, cols, wanted, page, rpp):
+    try:
+        cursor = dataset.query(wrap(sql, limit=rpp, offset=(page - 1) * rpp))
+        result_cols = [d[0] for d in cursor.description]
+        positions = [result_cols.index(c) for c in cols]
+        for row in cursor.fetchall():
+            values = [
+                bytes(v) if isinstance(v, memoryview) else v
+                for v in (row[p] for p in positions)]
+            if len(values) == len(wanted) and all(
+                    values_equal(a, b) for a, b in zip(values, wanted)):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _query_view(template, table=None):
     dataset = get_dataset()
     sql = request.values.get('sql') or ''
@@ -597,6 +694,17 @@ def _query_view(template, table=None):
         except Exception:
             total = total_pages = None
 
+    # A compare-page backlink asks us to open the original query and land
+    # on the page containing one particular row, identified by the chosen
+    # key columns. The original query (sql) is untouched throughout.
+    focus = None
+    if (request.method == 'GET' and single_read and not explain and
+            result is not None and result.kind == 'rows' and
+            request.args.get('focus')):
+        focus = _resolve_focus(dataset, sql, request.args, page, rpp)
+        if isinstance(focus, Response):
+            return focus
+
     error = None
     if result is not None and result.kind == 'error':
         error = result.error
@@ -608,6 +716,9 @@ def _query_view(template, table=None):
         allow_edit=allow_edit,
         default_sql=default_sql,
         error=error,
+        focus=focus,
+        focus_cols=[c for c in
+                    (request.args.get('focus_cols') or '').split(',') if c],
         fk_lookup=fk_lookup,
         ordering=ordering,
         page=page,
@@ -626,6 +737,162 @@ def _query_view(template, table=None):
 @app.route('/query/', methods=['GET', 'POST'])
 def generic_query():
     return _query_view('query.html')
+
+#
+# Row-by-row comparison of two result sets (possibly two database files).
+#
+
+COMPARE_TABS = OrderedDict((
+    ('all', 'All differences'),
+    ('added', 'Added'),
+    ('deleted', 'Deleted'),
+    ('modified', 'Changed'),
+))
+
+def _compare_param(suffix):
+    dataset_key = request.values.get('dataset_%s' % suffix, '')
+    sql = (request.values.get('sql_%s' % suffix) or '').strip()
+    if dataset_key not in datasets:
+        return None, sql, 'Choose a database for side %s.' % suffix
+    return datasets[dataset_key], sql, None
+
+def _fetch_columns(dataset, sql):
+    # Read-only validation, then take column names without materializing.
+    statements = split_statements(sql) if sql.strip() else []
+    if len(statements) != 1 or not is_read(dataset, sql):
+        raise CompareError('Provide one read-only SELECT statement.')
+    cursor = dataset.query(wrap(sql, limit=0))
+    return [d[0] for d in cursor.description]
+
+@app.route('/compare/columns/', methods=['GET'])
+def compare_columns():
+    # JSON probe used by the form to render the key-column checkboxes.
+    side = request.args.get('side')
+    dataset_key = request.args.get('dataset')
+    sql = (request.args.get('sql') or '').strip()
+    if side not in ('l', 'r') or dataset_key not in datasets:
+        return jsonify({'error': 'Bad request.'}), 400
+    dataset = datasets[dataset_key]
+    dataset.connect(reuse_if_open=True)
+    try:
+        columns = _fetch_columns(dataset, sql)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'columns': columns})
+
+@app.route('/compare/focus/')
+def compare_focus_redirect():
+    # Switch the active database, then open the original query focused on
+    # one row. Parameters other than name are forwarded untouched.
+    name = request.args.get('name')
+    if name not in datasets:
+        flash('Database is no longer loaded.', 'danger')
+        return redirect(url_for('index'))
+    session['dataset'] = name
+    params = [(k, v) for k, v in request.args.items(multi=True)
+              if k != 'name']
+    target = '/query/'
+    if params:
+        target += '?' + urlencode(params)
+    return redirect(target)
+
+def _build_comparison(requested_tab):
+    left_ds, left_sql, err_l = _compare_param('l')
+    right_ds, right_sql, err_r = _compare_param('r')
+    errors = [e for e in (err_l, err_r) if e]
+    keys = request.values.getlist('key')
+    tab = requested_tab if requested_tab in COMPARE_TABS else 'all'
+    page_arg = request.values.get('page') or ''
+    page = max(int(page_arg), 1) if page_arg.isdigit() else 1
+
+    context = {
+        'compare_tabs': COMPARE_TABS,
+        'dataset_l': left_ds,
+        'dataset_r': right_ds,
+        'sql_l': left_sql,
+        'sql_r': right_sql,
+        'keys': keys,
+        'tab': tab,
+        'page': page,
+        'errors': errors,
+        'comparison': None,
+        'rows': None,
+        'has_next': False,
+        'change_flags': None,
+        'total_pages': None,
+    }
+    if errors:
+        return context
+
+    # GETs arriving without both queries are a fresh, empty form.
+    if not (left_sql and right_sql):
+        return context
+
+    comparison = Comparison(
+        [(left_ds.filename, left_sql), (right_ds.filename, right_sql)],
+        keys,
+        page_size=app.config['COMPARE_ROWS_PER_PAGE'])
+    try:
+        comparison.__enter__()
+    except CompareError as exc:
+        context['errors'].append(str(exc))
+        return context
+    except Exception as exc:
+        app.logger.exception('Error running comparison.')
+        context['errors'].append('Could not run the comparison: %s' % exc)
+        return context
+
+    comparison.page = page
+    try:
+        rows, has_next = comparison.page_rows(tab)
+    except Exception as exc:
+        comparison.__exit__(None, None, None)
+        app.logger.exception('Error fetching comparison page.')
+        context['errors'].append('Could not fetch this page: %s' % exc)
+        return context
+
+    change_flags = None
+    if tab == 'modified':
+        change_flags = [comparison.modified_changes(r) for r in rows]
+
+    total = comparison.summary['total']
+    if tab in ('added', 'deleted', 'modified'):
+        total = comparison.summary[tab]
+    total_pages = max(1, int(math.ceil(total / float(comparison.page_size))))
+    page = max(min(page, total_pages), 1)
+
+    context.update(
+        comparison=comparison,
+        rows=rows,
+        has_next=has_next,
+        change_flags=change_flags,
+        total_pages=total_pages)
+    return context
+
+@app.route('/compare/', methods=['GET'])
+def compare():
+    tab = request.args.get('tab') or 'all'
+    context = _build_comparison(tab)
+    comparison = context['comparison']
+    try:
+        resp = make_response(render_template('compare.html', **context))
+    finally:
+        if comparison is not None:
+            comparison.__exit__(None, None, None)
+    return resp
+
+@app.route('/compare/results/', methods=['GET'])
+def compare_results():
+    # Fragment endpoint: returns just the summary + results panel, so the
+    # page can refresh results in place when conditions change quickly.
+    tab = request.args.get('tab') or 'all'
+    context = _build_comparison(tab)
+    comparison = context['comparison']
+    try:
+        return render_template('compare_results.html', **context)
+    finally:
+        if comparison is not None:
+            comparison.__exit__(None, None, None)
 
 def require_table(fn):
     @wraps(fn)
@@ -1517,6 +1784,16 @@ def encode_pk(row, pk):
         values = [row[pk.name]]
     return key_encode(values)
 
+@app.template_global('key_encode')
+def _template_key_encode(values):
+    # Row anchors are built from arbitrary result columns (compare-page
+    # backlinks), not just a table primary key.
+    return key_encode(list(values))
+
+@app.template_global('value_type_name')
+def _template_type_name(value):
+    return type_name(value)
+
 def decode_pk(model, token):
     pk = model._meta.primary_key
     values = key_decode(token)
@@ -1558,9 +1835,21 @@ def value_filter(value, max_length=50):
     if isinstance(value, memoryview):
         value = bytes(value)
     if isinstance(value, (bytes, bytearray)):
+        value = bytes(value)
+        # Only show a BLOB as text when its bytes are valid UTF-8 made of
+        # printable characters (newlines/tabs allowed). A BLOB like
+        # b'\x03\x04' is also valid UTF-8 but invisible, which would hide
+        # both the value and the fact that it is binary.
+        is_text = False
         try:
-            value = value.decode('utf8')
+            decoded = value.decode('utf8')
         except UnicodeDecodeError:
+            decoded = None
+        if decoded is not None and all(
+                ch in '\n\r\t' or ord(ch) >= 0x20 for ch in decoded):
+            value = decoded
+            is_text = True
+        if not is_text:
             if app.config['BLOB_AS_BASE64']:
                 value = base64.b64encode(value).decode('utf8')
             else:

@@ -199,6 +199,16 @@ App = window.App || {};
         if (sqlTextarea.length > 0) {
             sqlTextarea.focus();
         }
+
+        if (exports.initializeCompare) {
+            exports.initializeCompare();
+        }
+
+        /* A compare-page backlink lands on the page of one row. */
+        var focusRow = document.getElementById('focus-row');
+        if (focusRow) {
+            focusRow.scrollIntoView({block: 'center'});
+        }
     };
 
     /* Per-database namespace for localStorage keys. */

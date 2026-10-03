@@ -1,0 +1,53 @@
+.compare-source h5 {
+  font-size: 0.95rem;
+}
+
+.compare-loading {
+  opacity: 0.55;
+}
+
+.compare-grid td,
+.compare-grid th {
+  vertical-align: top;
+}
+
+.compare-grid .diff-changed {
+  background-color: #fff3cd;
+  outline: 1px solid #ffe69c;
+  font-weight: 600;
+}
+
+.compare-grid .compare-kind-0 {
+  background-color: #f8d7da;
+}
+
+.compare-grid .compare-kind-1 {
+  background-color: #d1e7dd;
+}
+
+.compare-grid .cell-missing {
+  background-color: #f1f3f5;
+}
+
+.compare-grid .compare-side-only {
+  color: #6c757d;
+  background-color: #f8f9fa;
+}
+
+.compare-links {
+  white-space: nowrap;
+}
+
+.compare-links .compare-jump {
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+tr.row-focus > td {
+  background-color: #ffe69c !important;
+  box-shadow: inset 0 0 0 2px #ffc107;
+}
+
+.compare-summary .badge {
+  font-size: 0.95rem;
+}

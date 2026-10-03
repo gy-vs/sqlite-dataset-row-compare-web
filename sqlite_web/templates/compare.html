@@ -1,0 +1,78 @@
+{% extends "base_tables.html" %}
+
+{% block content_title %}Compare rows{% endblock %}
+
+{% block extra_head %}
+  <link rel=stylesheet type=text/css href="{{ url_for('static', filename='css/compare.css') }}" />
+{% endblock %}
+
+{% block extra_scripts %}
+  <script type="text/javascript">
+    window.COMPARE_RESULTS_URL = {{ url_for('compare_results')|tojson }};
+    window.COMPARE_COLUMNS_URL = {{ url_for('compare_columns')|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='js/compare.js') }}" type="text/javascript"></script>
+{% endblock %}
+
+{% macro source_block(side, selected_ds, sql, label) %}
+  <div class="compare-source">
+    <h5 class="text-muted">{{ label }}</h5>
+    <div class="form-group">
+      <label for="dataset-{{ side }}">Database</label>
+      <select class="form-control form-control-sm compare-dataset" id="dataset-{{ side }}"
+              name="dataset_{{ side }}" data-side="{{ side }}">
+        {% for ds in datasets.values() %}
+          <option value="{{ ds.filename }}"{% if selected_ds and ds.filename == selected_ds.filename %} selected{% endif %}
+                  title="{{ ds.filename }}">{{ ds.short_path }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="sql-{{ side }}">Query (read-only SELECT)</label>
+      <textarea class="form-control form-control-sm remember-size compare-sql" id="sql-{{ side }}"
+                name="sql_{{ side }}" data-side="{{ side }}" rows="4">{{ sql }}</textarea>
+    </div>
+  </div>
+{% endmacro %}
+
+{% block content %}
+  <h3>Compare rows</h3>
+  <p class="text-muted small">
+    Run a read-only SELECT against each side, then choose the column(s) whose values
+    identify the same row. NULL only matches NULL and values with different types
+    (e.g. <code>1</code> and <code>1.0</code>) count as different.
+  </p>
+
+  <form id="compare-form" action="{{ url_for('compare') }}" method="get">
+    <div class="form-row">
+      <div class="col-md-6">{{ source_block('l', dataset_l, sql_l, 'Left (before)') }}</div>
+      <div class="col-md-6">{{ source_block('r', dataset_r, sql_r, 'Right (after)') }}</div>
+    </div>
+
+    <div class="form-group">
+      <label>Key columns (identify the same row on both sides)</label>
+      <div id="compare-keys" class="d-flex flex-wrap">
+        {% for key in keys %}
+          <div class="form-check mr-3 compare-key-existing">
+            <input class="form-check-input compare-key" type="checkbox" name="key"
+                   value="{{ key }}" checked data-column="{{ key }}" />
+            <label class="form-check-label" data-column="{{ key }}">{{ key }}</label>
+          </div>
+        {% endfor %}
+        <span class="text-muted small compare-keys-hint{% if keys %} d-none{% endif %}">
+          Choose both databases and queries, then Load columns.
+        </span>
+      </div>
+      <button class="btn btn-sm btn-outline-secondary mt-1" id="compare-load-columns"
+              type="button">Load columns</button>
+    </div>
+
+    <button class="btn btn-primary" type="submit">Compare</button>
+  </form>
+
+  <hr />
+
+  <div id="compare-results">
+    {% include "compare_results.html" %}
+  </div>
+{% endblock %}

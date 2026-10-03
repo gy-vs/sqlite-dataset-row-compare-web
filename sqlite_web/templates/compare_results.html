@@ -1,0 +1,157 @@
+{% if errors %}
+  {% for error in errors %}
+    <div class="alert alert-warning compare-error">{{ error }}</div>
+  {% endfor %}
+{% endif %}
+
+{% if comparison %}
+  {% set cmp = comparison %}
+  {% set s = cmp.summary %}
+  {% set union_cols = cmp.columns[0] + cmp.right_only %}
+
+  {% macro render_cell(v) %}
+    {% if v is none %}<code>NULL</code>{% else %}{{ v|value_filter|safe }}{% endif %}
+  {% endmacro %}
+
+  {# Back to the source query, focused on the row identified by the keys.
+     The original sql is forwarded unchanged. #}
+  {% macro row_link(side, key_values) %}
+    {{ url_for('compare_focus_redirect') }}?name={{ (dataset_l.filename if side == 'l' else dataset_r.filename)|urlencode }}&sql={{ (sql_l if side == 'l' else sql_r)|urlencode }}&focus={{ key_encode(key_values)|urlencode }}&focus_cols={{ keys|join(',')|urlencode }}
+  {% endmacro %}
+
+  <div class="compare-summary">
+    <h4>
+      <span class="badge badge-dark">Total differences: {{ s.total }}</span>
+      <span class="badge badge-success ml-2">Added {{ s.added }}</span>
+      <span class="badge badge-danger ml-2">Deleted {{ s.deleted }}</span>
+      <span class="badge badge-warning ml-2">Changed {{ s.modified }}</span>
+      <span class="badge badge-light ml-2">Unchanged {{ s.unchanged }}</span>
+    </h4>
+    <p class="small text-muted mb-1">
+      Left rows: {{ s.left_rows }} &middot; Right rows: {{ s.right_rows }}
+    </p>
+    {% if cmp.left_only or cmp.right_only %}
+      <p class="small text-muted mb-0">
+      {% if cmp.left_only %}
+        Columns only on the left:
+        {% for c in cmp.left_only %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+      {% if cmp.right_only %}
+        <br />Columns only on the right:
+        {% for c in cmp.right_only %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+      </p>
+    {% endif %}
+  </div>
+
+  <ul class="nav nav-tabs mt-2" id="compare-tabs">
+    {% for tab_id, tab_label in compare_tabs.items() %}
+      {% set count = s.total if tab_id == 'all' else s[tab_id] %}
+      <li class="nav-item">
+        <a class="nav-link{% if tab == tab_id %} active{% endif %} compare-tab"
+           href="#" data-tab="{{ tab_id }}">{{ tab_label }} ({{ count }})</a>
+      </li>
+    {% endfor %}
+  </ul>
+
+  {% if not rows %}
+    <p class="mt-3 text-muted">No rows in this category.</p>
+  {% else %}
+    <div class="table-wrapper mt-2">
+    <table class="table table-sm table-striped small cell-content compare-grid">
+      <thead>
+        <tr>
+          <th></th>
+          {% if tab == 'modified' %}
+            {% for k in keys %}<th class="compare-key-col">{{ k }}</th>{% endfor %}
+            {% for col in cmp.shared_nonkey %}
+              <th class="compare-lval">{{ col }}<br /><small class="text-muted">left</small></th>
+              <th class="compare-rval">{{ col }}<br /><small class="text-muted">right</small></th>
+            {% endfor %}
+            {% for col in cmp.left_only %}<th class="compare-side-only">{{ col }} <small class="text-muted">(L)</small></th>{% endfor %}
+            {% for col in cmp.right_only %}<th class="compare-side-only">{{ col }} <small class="text-muted">(R)</small></th>{% endfor %}
+          {% elif tab == 'all' %}
+            {% for col in union_cols %}<th>{{ col }}</th>{% endfor %}
+          {% else %}
+            {% set cols = cmp.columns[1] if tab == 'added' else cmp.columns[0] %}
+            {% for col in cols %}<th>{{ col }}</th>{% endfor %}
+          {% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          {% if tab == 'modified' %}
+            {% set row_flags = change_flags[loop.index0] %}
+            {% set kv = row[:keys|length] %}
+            <tr class="compare-row compare-modified">
+              <td class="compare-links">
+                <a href="{{ row_link('l', kv) }}" class="compare-jump px-1" title="Open in left query">L</a>
+                <a href="{{ row_link('r', kv) }}" class="compare-jump px-1" title="Open in right query">R</a>
+              </td>
+              {% for v in kv %}
+                <td{% if v is number or v is none %} class="num"{% endif %}>{{ render_cell(v) }}</td>
+              {% endfor %}
+              {% set ns = namespace(pos=keys|length) %}
+              {% for col in cmp.shared_nonkey %}
+                {% set lv = row[ns.pos] %}
+                {% set rv = row[ns.pos + 1] %}
+                {% set changed = row_flags[loop.index0] %}
+                <td class="compare-lval{% if changed %} diff-changed{% endif %}"
+                    title="left {{ col }}: {{ value_type_name(lv) }}">{{ render_cell(lv) }}</td>
+                <td class="compare-rval{% if changed %} diff-changed{% endif %}"
+                    title="right {{ col }}: {{ value_type_name(rv) }}">{{ render_cell(rv) }}</td>
+                {% set ns.pos = ns.pos + 2 %}
+              {% endfor %}
+              {% set base = keys|length + cmp.shared_nonkey|length * 2 %}
+              {% for col in cmp.left_only %}
+                <td class="compare-side-only">{{ render_cell(row[base + loop.index0]) }}</td>
+              {% endfor %}
+              {% for col in cmp.right_only %}
+                <td class="compare-side-only">{{ render_cell(row[base + cmp.left_only|length + loop.index0]) }}</td>
+              {% endfor %}
+            </tr>
+          {% elif tab == 'all' %}
+            {% set kind = row[0] %}
+            {% set vals = row[1:] %}
+            {% set kv = [] %}
+            {% for k in keys %}{% set _ = kv.append(vals[union_cols.index(k)]) %}{% endfor %}
+            <tr class="compare-row compare-kind-{{ kind }}">
+              <td class="compare-links">
+                <span class="badge {% if kind == 0 %}badge-danger{% elif kind == 1 %}badge-success{% else %}badge-warning{% endif %}">
+                  {% if kind == 0 %}deleted{% elif kind == 1 %}added{% else %}changed{% endif %}
+                </span>
+                <a href="{{ row_link('l' if kind != 1 else 'r', kv) }}" class="compare-jump px-1"
+                   title="Open in the original query">{{ 'L' if kind != 1 else 'R' }}</a>
+              </td>
+              {% for col in union_cols %}
+                {% set v = vals[loop.index0] %}
+                {% if (kind == 0 and col not in cmp.columns[0]) or (kind == 1 and col not in cmp.columns[1]) %}
+                  <td class="cell-missing"></td>
+                {% else %}
+                  <td{% if v is number or v is none %} class="num"{% endif %}>{{ render_cell(v) }}</td>
+                {% endif %}
+              {% endfor %}
+            </tr>
+          {% else %}
+            {% set cols = cmp.columns[1] if tab == 'added' else cmp.columns[0] %}
+            {% set side = 'r' if tab == 'added' else 'l' %}
+            {% set kv = [] %}
+            {% for k in keys %}{% set _ = kv.append(row[cols.index(k)]) %}{% endfor %}
+            <tr class="compare-row {% if tab == 'added' %}compare-added{% else %}compare-deleted{% endif %}">
+              <td class="compare-links">
+                <a href="{{ row_link(side, kv) }}" class="compare-jump px-1"
+                   title="Open in the original query">{{ side }}</a>
+              </td>
+              {% for col in cols %}
+                <td{% if row[loop.index0] is number or row[loop.index0] is none %} class="num"{% endif %}>{{ render_cell(row[loop.index0]) }}</td>
+              {% endfor %}
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+
+    {% include "compare_pagination.html" %}
+  {% endif %}
+{% endif %}

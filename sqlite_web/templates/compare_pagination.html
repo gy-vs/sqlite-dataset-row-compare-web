@@ -1,0 +1,25 @@
+{% set qs_parts = ['tab=' ~ tab] %}
+{% for k in keys %}{% set _ = qs_parts.append('key=' ~ k|urlencode) %}{% endfor %}
+{% set _ = qs_parts.append('dataset_l=' ~ dataset_l.filename|urlencode) %}
+{% set _ = qs_parts.append('sql_l=' ~ sql_l|urlencode) %}
+{% set _ = qs_parts.append('dataset_r=' ~ dataset_r.filename|urlencode) %}
+{% set _ = qs_parts.append('sql_r=' ~ sql_r|urlencode) %}
+<nav class="compare-pagination">
+  <ul class="pagination">
+    <li class="{% if page < 2 %}disabled {% endif %}page-item">
+      <a class="page-link compare-page" data-page="1" href="{{ url_for('compare') }}?{{ qs_parts|join('&') }}&page=1">&laquo;</a>
+    </li>
+    <li class="{% if page < 2 %}disabled {% endif %}page-item">
+      <a class="page-link compare-page" data-page="{{ page - 1 }}" href="{{ url_for('compare') }}?{{ qs_parts|join('&') }}&page={{ page - 1 }}">&lsaquo;</a>
+    </li>
+    <li class="page-item disabled">
+      <span class="page-link">Page {{ page }} of {{ total_pages }}</span>
+    </li>
+    <li class="{% if page >= total_pages %}disabled {% endif %}page-item">
+      <a class="page-link compare-page" data-page="{{ page + 1 }}" href="{{ url_for('compare') }}?{{ qs_parts|join('&') }}&page={{ page + 1 }}">&rsaquo;</a>
+    </li>
+    <li class="{% if page >= total_pages %}disabled {% endif %}page-item">
+      <a class="page-link compare-page" data-page="{{ total_pages }}" href="{{ url_for('compare') }}?{{ qs_parts|join('&') }}&page={{ total_pages }}">&raquo;</a>
+    </li>
+  </ul>
+</nav>

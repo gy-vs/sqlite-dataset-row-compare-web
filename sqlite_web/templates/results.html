@@ -30,8 +30,14 @@
       </tr>
     </thead>
     <tbody>
+      {% set focus_cols = focus_cols or [] %}
       {% for row in result.rows %}
-        <tr>
+        {% if focus_cols %}
+          {% set fv = [] %}
+          {% for c in focus_cols %}{% set _ = fv.append(row[result.columns.index(c)]) %}{% endfor %}
+          {% set row_token = key_encode(fv) %}
+        {% endif %}
+        <tr{% if focus and row_token == focus %} class="row-focus" id="focus-row"{% endif %}>
           {% if show_bulk %}
             <td><input class="toggle-pk" name="pk" type="checkbox" value="{{ result.keys[loop.index0] }}" aria-label="Select row" /></td>
           {% endif %}
