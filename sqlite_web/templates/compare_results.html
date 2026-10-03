@@ -1,0 +1,142 @@
+{% macro render_cell(cell) %}
+  {% set tag, value = cell %}
+  {% if value is none %}
+    <code class="diff-null">NULL</code>
+  {% elif tag == 'blob' %}
+    <span class="diff-blob" title="BLOB">X'{{ value.hex()[:64] }}{% if value|length > 32 %}…{% endif %}'</span>
+  {% else %}
+    {{ value|value_filter|safe }}
+  {% endif %}
+  <span class="diff-type diff-type-{{ tag }}">{{ tag }}</span>
+{% endmacro %}
+
+{% if error %}
+  <div class="alert alert-danger">{{ error }}</div>
+{% elif result is not none %}
+  {# Total first, so it is visible without scrolling. #}
+  <div class="diff-summary">
+    <span class="diff-total">Differences: <strong>{{ result.total }}</strong></span>
+    <span class="badge badge-added">+{{ result.added|length }} added</span>
+    <span class="badge badge-deleted">&minus;{{ result.deleted|length }} deleted</span>
+    <span class="badge badge-changed">~{{ result.changed|length }} changed</span>
+  </div>
+
+  {% if result.only_a or result.only_b %}
+    <div class="alert alert-warning py-2">
+      The two sides have different columns.
+      {% if result.only_a %}
+        <div>Only on the left: {% for c in result.only_a %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
+      {% endif %}
+      {% if result.only_b %}
+        <div>Only on the right: {% for c in result.only_b %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% for warning in result.warnings %}
+    <div class="alert alert-warning py-2">{{ warning }}</div>
+  {% endfor %}
+
+  {# Section filters. Each keeps the whole comparison definition. #}
+  {% set base_qs %}a_dataset={{ spec_a.dataset_key|urlencode }}&a_source={{ spec_a.source_type }}&a_table={{ spec_a.table|urlencode }}&a_sql={{ spec_a.sql|urlencode }}&b_dataset={{ spec_b.dataset_key|urlencode }}&b_source={{ spec_b.source_type }}&b_table={{ spec_b.table|urlencode }}&b_sql={{ spec_b.sql|urlencode }}{% for k in key_columns %}&key={{ k|urlencode }}{% endfor %}{% endset %}
+  <ul class="nav nav-pills diff-filter mb-2">
+    {% for name, label, count in (('all', 'All', result.total), ('added', 'Added', result.added|length), ('deleted', 'Deleted', result.deleted|length), ('changed', 'Changed', result.changed|length)) %}
+      <li class="nav-item">
+        <a class="nav-link nav-pill-{{ name }}{% if show == name %} active{% endif %} diff-filter-link" href="{{ url_for('compare') }}?{{ base_qs }}&show={{ name }}">{{ label }} ({{ count }})</a>
+      </li>
+    {% endfor %}
+  </ul>
+
+  {% if result.total == 0 %}
+    <p>No differences — the two sides match on all keyed rows and common columns.</p>
+  {% elif entries %}
+    {% if show != 'all' %}
+      <p class="small text-muted">Showing {{ page_start }}&ndash;{{ page_end }} of {{ result.section(show)|length }}.</p>
+    {% else %}
+      <p class="small text-muted">Showing {{ page_start }}&ndash;{{ page_end }} of {{ result.total }}.</p>
+    {% endif %}
+    <div class="table-wrapper">
+    <table class="table table-sm table-hover small cell-content diff-table">
+      <thead>
+        <tr>
+          <th></th>
+          {% for col in result.columns %}
+            <th data-col="{{ col }}">{{ col }}{% if col in result.key_columns %} <span class="diff-key-mark" title="Key column">&#9919;</span>{% endif %}</th>
+          {% endfor %}
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in entries %}
+          <tr class="diff-row diff-{{ entry.kind }}">
+            <td class="diff-kind-cell">
+              {% if entry.kind == 'added' %}
+                <span class="badge badge-added" title="Only on the right">added</span>
+              {% elif entry.kind == 'deleted' %}
+                <span class="badge badge-deleted" title="Only on the left">deleted</span>
+              {% else %}
+                <span class="badge badge-changed" title="Common columns differ">changed</span>
+              {% endif %}
+            </td>
+            {% for col in result.columns %}
+              {% set ca = entry.a.get(col) if entry.a else none %}
+              {% set cb = entry.b.get(col) if entry.b else none %}
+              {% set is_change = entry.kind == 'changed' and col in entry.changed_cols %}
+              {% set is_key = col in result.key_columns %}
+              <td class="diff-cell{% if is_change %} diff-changed-cell{% endif %}{% if is_key %} diff-key-cell{% endif %}"
+                  {% if is_change %}title="Changed: {{ col }}"{% endif %}>
+                {% if entry.kind == 'added' %}
+                  {% if cb is not none %}{{ render_cell(cb) }}{% endif %}
+                {% elif entry.kind == 'deleted' %}
+                  {% if ca is not none %}{{ render_cell(ca) }}{% endif %}
+                {% else %}
+                  {% if is_change %}
+                    <span class="diff-old">{{ render_cell(ca) }}</span>
+                    <span class="diff-arrow">&rarr;</span>
+                    <span class="diff-new">{{ render_cell(cb) }}</span>
+                  {% elif ca is not none %}
+                    {{ render_cell(ca) }}
+                  {% endif %}
+                {% endif %}
+              </td>
+            {% endfor %}
+            {% set token = entry.key|encode_typed_key %}
+            <td class="diff-goto-cell text-nowrap">
+              {% if entry.href_a %}
+                <a class="diff-goto diff-goto-a btn btn-outline-secondary btn-sm"
+                   href="{{ entry.href_a }}&focus_key={{ token }}"
+                   title="Open this row on the left, keeping the original query">left &#8599;</a>
+              {% endif %}
+              {% if entry.href_b %}
+                <a class="diff-goto diff-goto-b btn btn-outline-secondary btn-sm"
+                   href="{{ entry.href_b }}&focus_key={{ token }}"
+                   title="Open this row on the right, keeping the original query">right &#8599;</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+
+    {% if total_pages > 1 %}
+      <nav>
+        <ul class="pagination pagination-sm">
+          <li class="page-item{% if page < 2 %} disabled{% endif %}">
+            <a class="page-link diff-page-link" href="{{ url_for('compare') }}?{{ base_qs }}&show={{ show }}&page=1">&laquo;</a>
+          </li>
+          <li class="page-item{% if page < 2 %} disabled{% endif %}">
+            <a class="page-link diff-page-link" href="{{ url_for('compare') }}?{{ base_qs }}&show={{ show }}&page={{ page - 1 }}">&lsaquo;</a>
+          </li>
+          <li class="page-item disabled"><span class="page-link">Page {{ page }} of {{ total_pages }}</span></li>
+          <li class="page-item{% if page >= total_pages %} disabled{% endif %}">
+            <a class="page-link diff-page-link" href="{{ url_for('compare') }}?{{ base_qs }}&show={{ show }}&page={{ page + 1 }}">&rsaquo;</a>
+          </li>
+          <li class="page-item{% if page >= total_pages %} disabled{% endif %}">
+            <a class="page-link diff-page-link" href="{{ url_for('compare') }}?{{ base_qs }}&show={{ show }}&page={{ total_pages }}">&raquo;</a>
+          </li>
+        </ul>
+      </nav>
+    {% endif %}
+  {% endif %}
+{% endif %}

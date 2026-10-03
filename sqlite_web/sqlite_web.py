@@ -3,6 +3,7 @@
 __version__ = '0.8.2'
 
 import base64
+import contextlib
 import datetime
 import decimal
 import hashlib
@@ -79,11 +80,16 @@ from playhouse.migrate import migrate
 try:
     from sqlite_web.executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        split_statements, wrap, typed_key_decode, typed_key_encode)
 except ImportError:
     from executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        split_statements, wrap, typed_key_decode, typed_key_encode)
+
+try:
+    from sqlite_web import diff as diff_mod
+except ImportError:
+    import diff as diff_mod
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -92,6 +98,8 @@ DEBUG = False
 BLOB_AS_BASE64 = False  # Default is hex.
 ROWS_PER_PAGE = 50
 QUERY_ROWS_PER_PAGE = 1000
+DIFF_ROWS_PER_PAGE = 50
+DIFF_CACHE_TTL = 60
 TRUNCATE_VALUES = True
 SECRET_KEY = 'sqlite-database-browser-0.1.0'
 SESSION_COOKIE_NAME = 'sqlite_web_session'
@@ -104,6 +112,12 @@ app.config.from_object(__name__)
 datasets = {}
 datasets_lock = threading.Lock()
 dataset_config = {}
+
+# Recent diff results, keyed on both sides' definitions. Paging through a
+# large result reuses one; a database change or changed inputs miss it.
+_diff_cache = OrderedDict()
+_diff_cache_lock = threading.Lock()
+DIFF_CACHE_MAX = 8
 
 #
 # Database metadata objects.
@@ -498,6 +512,71 @@ def unload():
 
     return render_template('unload.html', selected=dataset)
 
+def _focus_page(dataset, sql, focus_cols, focus_key, page_size):
+    """Page (1-based) of the row identified by the encoded typed key."""
+    typed_key = _decode_typed_key(focus_key)
+    if typed_key is None:
+        return None
+    cols = _validated_focus_cols(dataset, sql, focus_cols, typed_key)
+    if not cols:
+        return None
+    quoted = ['"%s"' % c.replace('"', '""') for c in cols]
+    # typeof matches NULL and tells storage classes apart, so the integer 1
+    # and the text "1" never collide. IS (not =) is NULL-aware.
+    conds = ['(typeof(%s) IS ? AND %s IS ?)' % (q, q) for q in quoted]
+    qsql = ('SELECT n FROM (SELECT ROW_NUMBER() OVER () AS n, %s FROM (%s) '
+            'AS _) WHERE %s LIMIT 1' % (
+                ', '.join(quoted),
+                sql.rstrip('; \t\r\n'),
+                ' AND '.join(conds)))
+    params = []
+    for tag, value in typed_key:
+        params.extend([tag, value])
+    row = dataset.query(qsql, params).fetchone()
+    if row is None:
+        return None
+    return max(1, int(math.ceil(row[0] / float(page_size))))
+
+
+def _decode_typed_key(focus_key):
+    # The diff side encodes each key part as [tag, value] so type info
+    # survives the round-trip through the URL.
+    try:
+        decoded = typed_key_decode(focus_key)
+    except Exception:
+        return None
+    for tag, value in decoded:
+        if tag not in ('null', 'integer', 'real', 'text', 'blob'):
+            return None
+    return [(tag, diff_mod.normalize(value)) for tag, value in decoded]
+
+
+def _focus_index(result, focus_cols, focus_key):
+    typed_key = _decode_typed_key(focus_key)
+    if typed_key is None:
+        return -1
+    cols = [c for c in focus_cols if c in result.columns]
+    if len(cols) != len(typed_key):
+        return -1
+    positions = [result.columns.index(c) for c in cols]
+    wanted = list(typed_key)
+    for i, row in enumerate(result.rows):
+        actual = [diff_mod.make_cell(row[p]) for p in positions]
+        if actual == wanted:
+            return i
+    return -1
+
+
+def _validated_focus_cols(dataset, sql, focus_cols, typed_key):
+    cursor = dataset.query(wrap(sql, limit=0))
+    columns = [d[0] for d in cursor.description] if cursor.description else []
+    cols = []
+    for name in focus_cols:
+        if name in columns and name not in cols:
+            cols.append(name)
+    return cols if len(cols) == len(typed_key) else []
+
+
 def _query_view(template, table=None):
     dataset = get_dataset()
     sql = request.values.get('sql') or ''
@@ -576,10 +655,27 @@ def _query_view(template, table=None):
         elif explain and len(statements) > 1:
             flash('Only a single statement may be explained.', 'warning')
         elif len(statements) == 1:
+            # A jump from the diff view keeps this sql and asks to land on
+            # one particular row, so find its page before paging.
+            focus_cols = request.values.getlist('focus_cols')
+            focus_key = request.values.get('focus_key')
+            focus_page = None
+            if (request.method == 'GET' and focus_cols and focus_key and
+                    not explain and not ordering):
+                try:
+                    focus_page = _focus_page(dataset, sql, focus_cols,
+                                             focus_key, rpp)
+                except Exception:
+                    focus_page = None
+                if focus_page is not None:
+                    page = focus_page
             # EXPLAIN QUERY PLAN compiles the statement without running it.
             run_sql = 'EXPLAIN QUERY PLAN %s' % sql if explain else sql
             result = run_one(dataset, run_sql, page=page, page_size=rpp,
                              ordering=ordering)
+            if focus_page is not None and result.kind == 'rows':
+                result.focus_index = _focus_index(result, focus_cols,
+                                                  focus_key)
         else:
             results = run_script(dataset, statements, page_size=rpp)
 
@@ -1307,6 +1403,260 @@ def table_query(table):
         abort(404)
     return _query_view('table_query.html', table)
 
+#
+# Side-by-side row comparison.
+#
+
+def _side_spec(prefix):
+    return {
+        'dataset_key': request.args.get('%s_dataset' % prefix, ''),
+        'source_type': request.args.get('%s_source' % prefix, 'table'),
+        'table': request.args.get('%s_table' % prefix, ''),
+        'sql': request.args.get('%s_sql' % prefix, ''),
+    }
+
+def _resolve_side_dataset(spec):
+    key = spec['dataset_key']
+    if not key:
+        return None, 'Choose a database for each side.'
+    if key not in datasets:
+        return None, 'Selected database is no longer loaded.'
+    return datasets[key], None
+
+@contextlib.contextmanager
+def _side_connection(dataset):
+    """Borrow a dataset connection for one read. The request's selected
+    dataset already has an open connection (managed by teardown); other
+    registries are opened here and closed again so one comparison cannot
+    leave every loaded database with a live connection."""
+    current = g.get('dataset')
+    opened_here = dataset is not current or dataset._database.is_closed()
+    dataset.connect(reuse_if_open=True)
+    try:
+        yield
+    finally:
+        if opened_here and not dataset._database.is_closed():
+            dataset.close()
+
+
+def _side_cache_token(spec, dataset):
+    # Everything that can change the rows; the mtime covers another
+    # process writing the file between comparisons.
+    try:
+        stat = os.stat(dataset.filename)
+        mtime, size = stat.st_mtime_ns, stat.st_size
+    except OSError:
+        mtime, size = 0, 0
+    try:
+        schema_version = dataset._database.pragma('schema_version')
+    except Exception:
+        schema_version = 0
+    return (spec['dataset_key'], spec['source_type'], spec['table'],
+            spec['sql'].strip(), mtime, size, schema_version)
+
+def _fetch_side_cached(spec, dataset, key_columns):
+    token = _side_cache_token(spec, dataset)
+    with _diff_cache_lock:
+        cached = _diff_cache.get(token)
+    if cached is not None:
+        return cached
+    with _side_connection(dataset):
+        side = diff_mod.fetch_side(
+            dataset,
+            spec['dataset_key'],
+            spec['source_type'],
+            key_columns,
+            table=spec['table'] or None,
+            sql=spec['sql'] or None)
+    with _diff_cache_lock:
+        _diff_cache[token] = side
+        _diff_cache.move_to_end(token)
+        while len(_diff_cache) > DIFF_CACHE_MAX:
+            _diff_cache.popitem(last=False)
+    return side
+
+def _run_diff():
+    """Validate both sides and return (DiffResult, error)."""
+    spec_a = _side_spec('a')
+    spec_b = _side_spec('b')
+    key_columns = request.args.getlist('key')
+    show = request.args.get('show', 'all')
+    if show not in ('all', 'added', 'deleted', 'changed'):
+        show = 'all'
+
+    dataset_a, error = _resolve_side_dataset(spec_a)
+    if error:
+        return None, error, show, spec_a, spec_b
+    dataset_b, error = _resolve_side_dataset(spec_b)
+    if error:
+        return None, error, show, spec_a, spec_b
+
+    if spec_a['source_type'] not in ('table', 'query'):
+        spec_a['source_type'] = 'table'
+    if spec_b['source_type'] not in ('table', 'query'):
+        spec_b['source_type'] = 'table'
+
+    if not key_columns:
+        return None, 'Choose one or more key columns that identify the ' \
+                     'same row on both sides.', show, spec_a, spec_b
+
+    # Column discovery needs the key columns for fetch; read columns first
+    # so a bad side reports a clear message instead of a KeyError.
+    try:
+        cols_a = _peek_columns(spec_a, dataset_a, 'left')
+        cols_b = _peek_columns(spec_b, dataset_b, 'right')
+    except ValueError as exc:
+        return None, str(exc), show, spec_a, spec_b
+
+    common = [c for c in cols_a if c in cols_b]
+    bad = [c for c in key_columns if c not in common]
+    if bad:
+        return None, 'Key column(s) not present on both sides: %s' % \
+                     ', '.join(bad), show, spec_a, spec_b
+
+    side_a = _fetch_side_cached(spec_a, dataset_a, key_columns)
+    side_b = _fetch_side_cached(spec_b, dataset_b, key_columns)
+    href_a = url_for(
+        'compare_goto',
+        dataset=spec_a['dataset_key'],
+        source=spec_a['source_type'],
+        table=spec_a['table'],
+        sql=diff_mod.side_sql(spec_a['source_type'],
+                              spec_a['table'] or None,
+                              spec_a['sql'] or None),
+        focus_cols=key_columns)
+    href_b = url_for(
+        'compare_goto',
+        dataset=spec_b['dataset_key'],
+        source=spec_b['source_type'],
+        table=spec_b['table'],
+        sql=diff_mod.side_sql(spec_b['source_type'],
+                              spec_b['table'] or None,
+                              spec_b['sql'] or None),
+        focus_cols=key_columns)
+    result = diff_mod.compute_diff(side_a, side_b, key_columns,
+                                   href_a=href_a, href_b=href_b)
+    return result, None, show, spec_a, spec_b
+
+def _peek_columns(spec, dataset, label=''):
+    try:
+        sql = diff_mod.side_sql(spec['source_type'], spec['table'] or None,
+                                spec['sql'] or None)
+    except ValueError as exc:
+        prefix = ('%s side ' % label) if label else ''
+        raise ValueError('%s%s' % (prefix, exc))
+    with _side_connection(dataset):
+        columns = diff_mod.read_columns(dataset, sql)
+    # De-duplicated, as fetch_side does for the rows.
+    unique = []
+    for name in columns:
+        if name not in unique:
+            unique.append(name)
+    return unique
+
+@app.route('/compare/')
+def compare():
+    specs_submitted = bool(request.args.get('a_dataset'))
+    result = error = None
+    show = request.args.get('show', 'all')
+    spec_a = _side_spec('a')
+    spec_b = _side_spec('b')
+    key_columns = request.args.getlist('key')
+    page = 1
+    total_pages = 1
+    entries = []
+    page_start = page_end = 0
+
+    if specs_submitted:
+        result, error, show, spec_a, spec_b = _run_diff()
+        if result is not None:
+            entries_all = (result.added + result.deleted + result.changed
+                           if show == 'all' else result.section(show))
+            rpp = app.config['DIFF_ROWS_PER_PAGE']
+            total_pages = max(1, int(math.ceil(len(entries_all) /
+                                               float(rpp))))
+            raw_page = request.args.get('page') or ''
+            page = int(raw_page) if raw_page.isdigit() else 1
+            page = max(min(page, total_pages), 1)
+            entries = entries_all[(page - 1) * rpp:page * rpp]
+            if entries_all:
+                page_start = (page - 1) * rpp + 1
+                page_end = page_start + len(entries) - 1
+
+    fragment = request.args.get('fragment')
+    template = 'compare_results.html' if fragment else 'compare.html'
+    context = dict(
+        result=result,
+        error=error,
+        show=show,
+        spec_a=spec_a,
+        spec_b=spec_b,
+        key_columns=key_columns,
+        entries=entries,
+        page=page,
+        total_pages=total_pages,
+        page_start=page_start,
+        page_end=page_end,
+        submitted=specs_submitted)
+    if not fragment:
+        # Table names are read for every registry database; the connection
+        # helper only closes ones the request itself did not open.
+        tables_map = {}
+        for ds in datasets.values():
+            try:
+                with _side_connection(ds):
+                    tables_map[ds.filename] = sorted(ds.cached_tables())
+            except Exception:
+                tables_map[ds.filename] = []
+        context['tables_map'] = tables_map
+    return render_template(template, **context)
+
+@app.route('/compare/columns/')
+def compare_columns():
+    """JSON list of column names for one chosen side (read-only)."""
+    spec = {
+        'dataset_key': request.args.get('dataset', ''),
+        'source_type': request.args.get('source', 'table'),
+        'table': request.args.get('table', ''),
+        'sql': request.args.get('sql', ''),
+    }
+    dataset, error = _resolve_side_dataset(spec)
+    if error:
+        return jsonify({'error': error}), 400
+    try:
+        columns = _peek_columns(spec, dataset)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'columns': columns})
+
+@app.route('/compare/goto/')
+def compare_goto():
+    """Jump from a diff row back to that row in its source, keeping the
+    original query text. Selects the target database first."""
+    dataset_key = request.args.get('dataset', '')
+    source_type = request.args.get('source', 'table')
+    sql = request.args.get('sql', '')
+    table = request.args.get('table', '')
+    focus_key = request.args.get('focus_key', '')
+    focus_cols = request.args.getlist('focus_cols')
+    if dataset_key not in datasets or not focus_key or not focus_cols:
+        abort(404)
+    try:
+        key_decode(focus_key)
+    except Exception:
+        abort(404)
+    session['dataset'] = dataset_key
+    # A list-valued kwarg makes url_for repeat the query-string key.
+    params = {'sql': sql, 'focus_key': focus_key,
+              'focus_cols': list(focus_cols)}
+    if source_type == 'table' and table:
+        location = url_for('table_query', table=table, **params)
+    else:
+        location = url_for('generic_query', **params)
+    return redirect(location)
+
 def export(query, export_format, table=None):
     dataset = get_dataset()
     buf = StringIO()
@@ -1517,6 +1867,9 @@ def encode_pk(row, pk):
         values = [row[pk.name]]
     return key_encode(values)
 
+@app.template_filter('encode_typed_key')
+def encode_typed_filter(cells):
+    return typed_key_encode(cells)
 def decode_pk(model, token):
     pk = model._meta.primary_key
     values = key_decode(token)

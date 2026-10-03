@@ -31,7 +31,7 @@
     </thead>
     <tbody>
       {% for row in result.rows %}
-        <tr>
+        <tr{% if result.focus_index is defined and result.focus_index == loop.index0 %} class="focus-row" id="focus-row"{% endif %}>
           {% if show_bulk %}
             <td><input class="toggle-pk" name="pk" type="checkbox" value="{{ result.keys[loop.index0] }}" aria-label="Select row" /></td>
           {% endif %}

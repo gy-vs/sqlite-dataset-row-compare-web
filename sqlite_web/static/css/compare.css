@@ -1,0 +1,128 @@
+/* Compare page. */
+
+.compare-side {
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    padding: 12px;
+}
+.compare-side-title {
+    margin-bottom: 8px;
+}
+.compare-keys {
+    border: 1px dotted #cccccc;
+    border-radius: 4px;
+    padding: 8px;
+    min-height: 38px;
+}
+
+/* Summary at the very top of the results. */
+.diff-summary {
+    font-size: 1rem;
+    margin-bottom: 8px;
+}
+.diff-summary .badge {
+    font-size: 0.85rem;
+    margin-left: 8px;
+    font-weight: normal;
+}
+.badge-added {
+    color: #155724;
+    background-color: #d4edda;
+    border: 1px solid #c3e6cb;
+}
+.badge-deleted {
+    color: #721c24;
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
+}
+.badge-changed {
+    color: #856404;
+    background-color: #fff3cd;
+    border: 1px solid #ffeaa7;
+}
+
+ul.diff-filter .nav-link {
+    padding: 2px 10px;
+    font-size: 0.85rem;
+}
+.nav-pill-added.active { background-color: #28a745; }
+.nav-pill-deleted.active { background-color: #dc3545; }
+.nav-pill-changed.active { background-color: #e0a800; }
+
+/* Diff rows. */
+table.diff-table td,
+table.diff-table th {
+    vertical-align: top;
+}
+.diff-kind-cell {
+    white-space: nowrap;
+}
+tr.diff-added {
+    background-color: rgba(212, 237, 218, .45);
+}
+tr.diff-deleted {
+    background-color: rgba(248, 215, 218, .45);
+}
+tr.diff-changed {
+    background-color: rgba(255, 243, 205, .35);
+}
+tr.diff-row:hover > td {
+    background-color: rgba(0, 0, 0, .07);
+}
+
+.diff-cell.diff-changed-cell {
+    outline: 1px solid #e0a800;
+}
+.diff-key-cell {
+    background-color: rgba(0, 0, 0, .04);
+}
+.diff-old {
+    display: block;
+    background-color: rgba(220, 53, 69, .12);
+    border-radius: 3px;
+    padding: 0 4px;
+}
+.diff-new {
+    display: block;
+    background-color: rgba(40, 167, 69, .14);
+    border-radius: 3px;
+    padding: 0 4px;
+}
+.diff-arrow {
+    color: #999;
+    font-size: 10px;
+}
+.diff-null {
+    color: #c7254e;
+    font-weight: bold;
+}
+.diff-blob {
+    color: #6a51a3;
+}
+.diff-type {
+    display: none;  /* Hover affordance; shown only for changed cells. */
+}
+.diff-changed-cell .diff-type {
+    display: inline-block;
+    font-size: 9px;
+    color: #888;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 0 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+.diff-key-mark {
+    color: #888;
+    font-size: 10px;
+}
+.diff-goto-cell .btn {
+    font-size: 10px;
+    padding: 0 6px;
+}
+
+/* Highlight the row a compare jump lands on. */
+tr.focus-row > td {
+    background-color: #ffeaa7 !important;
+    box-shadow: inset 0 0 0 2px #e0a800;
+}

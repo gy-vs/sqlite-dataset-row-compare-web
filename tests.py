@@ -16,6 +16,9 @@ from sqlite_web.executor import run_one
 from sqlite_web.executor import run_script
 from sqlite_web.executor import split_statements
 from sqlite_web.executor import wrap
+from sqlite_web.executor import typed_key_decode
+from sqlite_web.executor import typed_key_encode
+from sqlite_web import diff as diff_mod
 
 
 class BaseExecutorTestCase(unittest.TestCase):
@@ -981,6 +984,429 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+#
+# Diff engine.
+#
+
+class DiffEngineTestCase(unittest.TestCase):
+    def setUp(self):
+        self.left = DataSet(SqliteDatabase(':memory:'))
+        self.right = DataSet(SqliteDatabase(':memory:'))
+        self.left.query(
+            'CREATE TABLE orders (order_no TEXT PRIMARY KEY, '
+            'amount REAL, status TEXT)')
+        self.right.query(
+            'CREATE TABLE orders (order_no TEXT PRIMARY KEY, '
+            'amount REAL, status TEXT)')
+
+    def load(self, ds, rows):
+        ds.query('DELETE FROM orders')
+        for row in rows:
+            ds.query('INSERT INTO orders VALUES (?, ?, ?)', row)
+
+    def diff(self, left_rows, right_rows, keys=('order_no',)):
+        self.load(self.left, left_rows)
+        self.load(self.right, right_rows)
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', list(keys),
+                                 table='orders')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', list(keys),
+                                 table='orders')
+        return diff_mod.compute_diff(sa, sb, list(keys))
+
+    def test_added_deleted_changed(self):
+        d = self.diff(
+            [('O1', 100.0, None), ('O2', 50.0, 'pending')],
+            [('O2', 50.0, 'settled'), ('O3', 75.0, None)])
+        self.assertEqual([e.key for e in d.added],
+                         [(('text', 'O3'),)])
+        self.assertEqual([e.key for e in d.deleted],
+                         [(('text', 'O1'),)])
+        self.assertEqual([e.key for e in d.changed],
+                         [(('text', 'O2'),)])
+        self.assertEqual(d.changed[0].changed_cols, ['status'])
+        self.assertEqual(d.total, 3)
+
+    def test_null_vs_value_is_change(self):
+        d = self.diff([('O1', 1.0, None)], [('O1', 1.0, 'settled')])
+        self.assertEqual(len(d.changed), 1)
+        self.assertEqual(d.changed[0].changed_cols, ['status'])
+
+    def test_type_difference_is_change(self):
+        # Integer 1 versus text "1", integer 2 versus real 2.0, and NULL
+        # versus a real value.
+        self.left.query('CREATE TABLE t (id INTEGER PRIMARY KEY, v)')
+        self.right.query('CREATE TABLE t (id INTEGER PRIMARY KEY, v)')
+        self.left.query('INSERT INTO t VALUES (?, ?)', (1, 1))
+        self.right.query('INSERT INTO t VALUES (?, ?)', (1, '1'))
+        self.left.query('INSERT INTO t VALUES (?, ?)', (2, 2))
+        self.right.query('INSERT INTO t VALUES (?, ?)', (2, 2.0))
+        self.left.query('INSERT INTO t VALUES (?, ?)', (3, None))
+        self.right.query('INSERT INTO t VALUES (?, ?)', (3, 3.0))
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', ['id'], table='t')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', ['id'], table='t')
+        d = diff_mod.compute_diff(sa, sb, ['id'])
+        self.assertEqual(len(d.changed), 3)
+        self.assertTrue(all(e.changed_cols == ['v'] for e in d.changed))
+
+    def test_equal_values_with_same_type_unchanged(self):
+        d = self.diff(
+            [('O1', 1.5, 'ok'), ('O2', None, None)],
+            [('O1', 1.5, 'ok'), ('O2', None, None)])
+        self.assertEqual(d.total, 0)
+
+    def test_blob_typed_and_compared(self):
+        self.left.query('CREATE TABLE bl (id BLOB PRIMARY KEY, n INTEGER)')
+        self.right.query('CREATE TABLE bl (id BLOB PRIMARY KEY, n INTEGER)')
+        self.left.query('INSERT INTO bl VALUES (?, ?)', (b'\x00\xff', 1))
+        self.right.query('INSERT INTO bl VALUES (?, ?)', (b'\x00\xff', 2))
+        # A text-looking key must not match the blob key.
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', ['id'], table='bl')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', ['id'], table='bl')
+        d = diff_mod.compute_diff(sa, sb, ['id'])
+        self.assertEqual(len(d.changed), 1)
+        self.assertEqual(d.changed[0].key, (('blob', b'\x00\xff'),))
+
+    def test_columns_only_on_one_side(self):
+        self.left.query('CREATE TABLE asym (id INTEGER PRIMARY KEY, a TEXT)')
+        self.right.query(
+            'CREATE TABLE asym (id INTEGER PRIMARY KEY, a TEXT, b TEXT)')
+        self.left.query("INSERT INTO asym VALUES (1, 'x')")
+        self.right.query("INSERT INTO asym VALUES (1, 'x', 'y')")
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', ['id'],
+                                 table='asym')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', ['id'],
+                                 table='asym')
+        d = diff_mod.compute_diff(sa, sb, ['id'])
+        self.assertEqual(d.only_a, [])
+        self.assertEqual(d.only_b, ['b'])
+        # An extra column with the same key/common values is not a change.
+        self.assertEqual(d.changed, [])
+
+    def test_duplicate_keys_reported(self):
+        self.left.query('CREATE TABLE dup (k TEXT, v TEXT)')
+        self.right.query('CREATE TABLE dup (k TEXT, v TEXT)')
+        self.left.query("INSERT INTO dup VALUES ('a', '1'), ('a', '2')")
+        self.right.query("INSERT INTO dup VALUES ('a', '1')")
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', ['k'], table='dup')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', ['k'], table='dup')
+        self.assertEqual(sa.duplicate_keys, 1)
+        d = diff_mod.compute_diff(sa, sb, ['k'])
+        self.assertTrue(any('duplicated key' in w for w in d.warnings))
+
+    def test_composite_key(self):
+        self.left.query(
+            'CREATE TABLE c2 (a TEXT, b TEXT, v INTEGER, '
+            'PRIMARY KEY (a, b))')
+        self.right.query(
+            'CREATE TABLE c2 (a TEXT, b TEXT, v INTEGER, '
+            'PRIMARY KEY (a, b))')
+        self.left.query("INSERT INTO c2 VALUES ('US', 'x', 1)")
+        self.right.query("INSERT INTO c2 VALUES ('US', 'x', 2)")
+        sa = diff_mod.fetch_side(self.left, 'l', 'table', ['a', 'b'],
+                                 table='c2')
+        sb = diff_mod.fetch_side(self.right, 'r', 'table', ['a', 'b'],
+                                 table='c2')
+        d2 = diff_mod.compute_diff(sa, sb, ['a', 'b'])
+        self.assertEqual(d2.changed[0].key,
+                         (('text', 'US'), ('text', 'x')))
+        self.assertEqual(d2.changed[0].changed_cols, ['v'])
+
+    def test_read_rejects_writes(self):
+        with self.assertRaises(ValueError):
+            diff_mod.read_columns(self.left, 'DROP TABLE orders')
+        with self.assertRaises(ValueError):
+            diff_mod.read_columns(self.left, 'SELECT 1; SELECT 2')
+
+    def test_query_source(self):
+        self.load(self.left, [('O1', 1.0, 'x'), ('O2', 2.0, 'y')])
+        sa = diff_mod.fetch_side(
+            self.left, 'l', 'query', ['order_no'],
+            sql="SELECT * FROM orders WHERE order_no = 'O1'")
+        self.assertEqual(list(sa.rows), [(('text', 'O1'),)])
+
+
+class TestTypedKey(unittest.TestCase):
+    def test_round_trip_preserves_type(self):
+        cells = [('null', None), ('integer', 1), ('real', 1.5),
+                 ('text', 'a'), ('blob', b'\x00\xff')]
+        decoded = typed_key_decode(typed_key_encode(cells))
+        self.assertEqual(decoded, cells)
+
+    def test_url_safe(self):
+        token = typed_key_encode([('blob', b'\xfb\xff' * 20)])
+        self.assertNotIn('+', token)
+        self.assertNotIn('/', token)
+
+
+class TwoSnapshotTestCase(unittest.TestCase):
+    """Two independent database files, the month-end scenario."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.before = os.path.join(self.tmp, 'orders_before.db')
+        self.after = os.path.join(self.tmp, 'orders_after.db')
+        self.create(self.before, [
+            ('O1', 100.0, None),
+            ('O2', 50.0, 'open'),
+            ('O3', 9.99, 'settled')])
+        self.create(self.after, [
+            ('O2', 55.0, 'settled'),       # amount + status changed
+            ('O3', 9.99, 'settled'),       # unchanged
+            ('O4', 75.0, None)])           # added
+        sw.datasets.clear()
+        sw.initialize_app([self.before, self.after])
+        sw.app.config['TESTING'] = True
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def create(self, path, rows, extra_ddl=''):
+        conn = sqlite3.connect(path)
+        conn.execute(
+            'CREATE TABLE orders (order_no TEXT PRIMARY KEY, '
+            'amount REAL, status TEXT)')
+        if extra_ddl:
+            conn.executescript(extra_ddl)
+        conn.executemany('INSERT INTO orders VALUES (?, ?, ?)', rows)
+        conn.commit()
+        conn.close()
+
+    def params(self, **overrides):
+        p = {
+            'a_dataset': os.path.realpath(self.before),
+            'a_source': 'table', 'a_table': 'orders', 'a_sql': '',
+            'b_dataset': os.path.realpath(self.after),
+            'b_source': 'table', 'b_table': 'orders', 'b_sql': '',
+            'key': 'order_no'}
+        p.update(overrides)
+        return p
+
+    def test_compare_page_renders_summary(self):
+        r = self.client.get('/compare/', query_string=self.params())
+        self.assertEqual(r.status_code, 200)
+        body = r.data.decode()
+        self.assertIn('Differences: <strong>3</strong>', body)
+        self.assertIn('+1 added', body)
+        self.assertIn('&minus;1 deleted', body)
+        self.assertIn('~1 changed', body)
+        # The changed row shows old -> new for each changed column.
+        self.assertIn('50.0', body)
+        self.assertIn('55.0', body)
+        self.assertIn('open', body)
+        self.assertIn('settled', body)
+        # NULL for the deleted row's status renders distinctly.
+        self.assertIn('diff-null', body)
+
+    def test_changed_cell_marks_field(self):
+        body = self.client.get('/compare/',
+                               query_string=self.params()).data.decode()
+        # Exactly the amount and status cells of O2 are marked changed.
+        self.assertIn('title="Changed: amount"', body)
+        self.assertIn('title="Changed: status"', body)
+
+    def test_columns_endpoint_for_table_and_query(self):
+        r = self.client.get('/compare/columns/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'table', 'table': 'orders'})
+        self.assertEqual(r.get_json()['columns'],
+                         ['order_no', 'amount', 'status'])
+        r = self.client.get('/compare/columns/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'query',
+            'sql': 'SELECT order_no, amount FROM orders'})
+        self.assertEqual(r.get_json()['columns'], ['order_no', 'amount'])
+
+    def test_columns_endpoint_rejects_write(self):
+        r = self.client.get('/compare/columns/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'query', 'sql': 'DELETE FROM orders'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('read-only', r.get_json()['error'])
+
+    def test_missing_key_reports_error_not_500(self):
+        p = self.params()
+        del p['key']
+        r = self.client.get('/compare/', query_string=p)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'key columns', r.data)
+
+    def test_key_column_missing_on_side(self):
+        r = self.client.get('/compare/',
+                            query_string=self.params(key='nope'))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'not present on both sides', r.data)
+
+    def test_asymmetric_columns_listed(self):
+        conn = sqlite3.connect(self.after)
+        conn.execute('ALTER TABLE orders ADD COLUMN cleared_at TEXT')
+        conn.commit()
+        conn.close()
+        body = self.client.get('/compare/',
+                               query_string=self.params()).data.decode()
+        self.assertIn('Only on the right', body)
+        self.assertIn('<code>cleared_at</code>', body)
+
+    def test_fragment_only_returns_results(self):
+        r = self.client.get('/compare/',
+                            query_string=self.params(fragment='1'))
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(b'<form id="compare-form"', r.data)
+        self.assertIn(b'diff-summary', r.data)
+
+    def test_goto_switches_database_and_keeps_sql(self):
+        token = typed_key_encode([('text', 'O2')])
+        r = self.client.get('/compare/goto/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'query',
+            'sql': "SELECT * FROM orders WHERE status = 'settled'",
+            'focus_cols': 'order_no', 'focus_key': token})
+        self.assertIn(r.status_code, (302, 303))
+        loc = r.headers['Location']
+        self.assertIn('/query/?sql=', loc)
+        self.assertIn('focus_key=', loc)
+        self.assertIn('focus_cols=order_no', loc)
+        with self.client.session_transaction() as s:
+            self.assertEqual(s['dataset'], os.path.realpath(self.after))
+        page = self.client.get(loc)
+        self.assertIn(b'focus-row', page.data)
+
+    def test_goto_table_source_uses_table_query(self):
+        token = typed_key_encode([('text', 'O2')])
+        r = self.client.get('/compare/goto/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'table', 'table': 'orders',
+            'sql': 'SELECT * FROM "orders"',
+            'focus_cols': 'order_no', 'focus_key': token})
+        self.assertIn('/orders/query/', r.headers['Location'])
+
+    def test_goto_rejects_bad_token(self):
+        r = self.client.get('/compare/goto/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'table', 'table': 'orders', 'sql': 'SELECT 1',
+            'focus_cols': 'order_no', 'focus_key': '@@bad@@'})
+        self.assertEqual(r.status_code, 404)
+
+    def test_type_aware_goto_distinguishes_int_from_text(self):
+        conn = sqlite3.connect(self.after)
+        conn.execute('CREATE TABLE typ (id INTEGER PRIMARY KEY, v)')
+        conn.executemany('INSERT INTO typ VALUES (?, ?)',
+                         [(1, 'text-one'), (2, 2)])
+        conn.commit()
+        conn.close()
+        conn = sqlite3.connect(self.before)
+        conn.execute('CREATE TABLE typ (id INTEGER PRIMARY KEY, v)')
+        conn.executemany('INSERT INTO typ VALUES (?, ?)',
+                         [(1, 1), (2, 'two')])
+        conn.commit()
+        conn.close()
+        # id=1: text "text-one" on after must not collide with anything.
+        token_text = typed_key_encode([('integer', 1)])
+        sw.app.config['QUERY_ROWS_PER_PAGE'] = 50
+        r = self.client.get('/compare/goto/', query_string={
+            'dataset': os.path.realpath(self.after),
+            'source': 'table', 'table': 'typ',
+            'sql': 'SELECT * FROM "typ"',
+            'focus_cols': 'id', 'focus_key': token_text})
+        page = self.client.get(r.headers['Location'])
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b'text-one', page.data)
+
+    def test_diff_is_read_only(self):
+        before_stat = os.stat(self.before)
+        after_stat = os.stat(self.after)
+        self.client.get('/compare/', query_string=self.params())
+        self.client.get('/compare/',
+                        query_string=self.params(
+                            a_source='query',
+                            a_sql='SELECT * FROM orders',
+                            b_source='query',
+                            b_sql='SELECT * FROM orders'))
+        self.assertEqual(os.stat(self.before).st_size, before_stat.st_size)
+        self.assertEqual(os.stat(self.after).st_size, after_stat.st_size)
+        conn = sqlite3.connect(self.before)
+        count, = conn.execute('SELECT COUNT(*) FROM orders').fetchone()
+        self.assertEqual(count, 3)
+        conn.close()
+
+
+class ComparePaginationTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.a = os.path.join(self.tmp, 'a.db')
+        self.b = os.path.join(self.tmp, 'b.db')
+        for path, n in ((self.a, 120), (self.b, 120)):
+            conn = sqlite3.connect(path)
+            conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+            if path == self.a:
+                conn.executemany('INSERT INTO t VALUES (?, ?)',
+                                 [(i, 'x') for i in range(120)])
+            else:
+                # ids 0..49 unchanged; 120..189 added (70); a-side ids
+                # 50..119 are deleted (70).
+                conn.executemany('INSERT INTO t VALUES (?, ?)',
+                                 [(i, 'x') for i in range(50)] +
+                                 [(i, 'y') for i in range(120, 190)])
+            conn.commit()
+            conn.close()
+        sw.datasets.clear()
+        sw.initialize_app([self.a, self.b])
+        sw.app.config['TESTING'] = True
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def params(self, **ov):
+        p = {'a_dataset': os.path.realpath(self.a), 'a_source': 'table',
+             'a_table': 't', 'a_sql': '',
+             'b_dataset': os.path.realpath(self.b), 'b_source': 'table',
+             'b_table': 't', 'b_sql': '', 'key': 'id'}
+        p.update(ov)
+        return p
+
+    def test_paginates_large_result(self):
+        r = self.client.get('/compare/', query_string=self.params())
+        self.assertIn(b'Page 1 of 3', r.data)  # 140 diffs / 50
+        r = self.client.get('/compare/',
+                            query_string=self.params(page='3'))
+        self.assertIn(b'Page 3 of 3', r.data)
+
+    def test_filter_paginates_independently(self):
+        r = self.client.get('/compare/',
+                            query_string=self.params(show='added'))
+        self.assertIn(b'Page 1 of 2', r.data)
+        r = self.client.get('/compare/',
+                            query_string=self.params(show='added', page='2'))
+        self.assertIn(b'51&ndash;70 of 70', r.data)
+        r = self.client.get('/compare/',
+                            query_string=self.params(show='changed'))
+        self.assertNotIn(b'pagination', r.data)  # no changed rows, no pager
+
+    def test_page_out_of_bounds_clamped(self):
+        r = self.client.get('/compare/',
+                            query_string=self.params(page='99'))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Page 3 of 3', r.data)
+
+
+class ReadOnlyCompareTestCase(TwoSnapshotTestCase):
+    def setUp(self):
+        super().setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.before, self.after], read_only=True)
+        sw.app.config['TESTING'] = True
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        super().tearDown()
+        sw.dataset_config['read_only'] = False
+
+    def test_compare_works_read_only(self):
+        r = self.client.get('/compare/', query_string=self.params())
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Differences:', r.data)
 
 
 if __name__ == '__main__':

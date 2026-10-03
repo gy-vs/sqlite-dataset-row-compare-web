@@ -199,6 +199,13 @@ App = window.App || {};
         if (sqlTextarea.length > 0) {
             sqlTextarea.focus();
         }
+
+        /* A jump from the compare view lands on the row that was clicked:
+           scroll it into view once, keeping the user's query in the box. */
+        var focusRow = document.getElementById('focus-row');
+        if (focusRow) {
+            focusRow.scrollIntoView({block: 'center'});
+        }
     };
 
     /* Per-database namespace for localStorage keys. */

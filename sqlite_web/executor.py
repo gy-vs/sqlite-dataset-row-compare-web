@@ -16,6 +16,7 @@ class Result:
     has_next: bool = False
     affected: int = -1
     error: str = ''
+    focus_index: int = -1  # Row to highlight/scroll to within .rows.
 
 
 def wrap(sql, ordering=None, limit=None, offset=0, select='*'):
@@ -114,3 +115,15 @@ def key_encode(values):
 def key_decode(token):
     decoded = base64.urlsafe_b64decode(token.encode())
     return [_dec(v) for v in json.loads(decoded)]
+
+
+def typed_key_encode(cells):
+    # Cells are (type-tag, value) pairs. The tag rides along so the target
+    # page can distinguish NULL and values of different storage classes.
+    payload = [[tag, _enc(value)] for tag, value in cells]
+    return base64.urlsafe_b64encode(
+        json.dumps(payload).encode()).decode()
+
+def typed_key_decode(token):
+    payload = json.loads(base64.urlsafe_b64decode(token.encode()))
+    return [(tag, _dec(value)) for tag, value in payload]

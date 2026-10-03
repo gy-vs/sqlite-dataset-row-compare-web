@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block content_title %}Compare{% endblock %}
+
+{% block extra_head %}
+  <link rel=stylesheet type=text/css href="{{ url_for('static', filename='css/compare.css') }}" />
+{% endblock %}
+
+{% block content %}
+<h3>Compare two result sets</h3>
+<p class="text-muted">
+  Pick a database, a table (or a read-only query) for each side, then choose the
+  column(s) that identify the same row. Rows present only on the right are
+  <em>added</em>, only on the left <em>deleted</em>, and matching rows with any
+  differing common column are <em>changed</em>. Nothing here writes to a
+  database.
+</p>
+
+<form id="compare-form" method="get" action="{{ url_for('compare') }}" autocomplete="off">
+  <div class="form-row">
+    {% for side in ('a', 'b') %}
+      {% set spec = spec_a if side == 'a' else spec_b %}
+      <div class="form-group col-md-6 compare-side" data-side="{{ side }}">
+        <h5 class="compare-side-title">{{ 'Left (old)' if side == 'a' else 'Right (new)' }}</h5>
+        <label for="{{ side }}-dataset">Database</label>
+        <select class="form-control form-control-sm compare-dataset" id="{{ side }}-dataset" name="{{ side }}_dataset">
+          <option value="">— select database —</option>
+          {% for ds in datasets.values() %}
+            <option value="{{ ds.filename }}"{% if spec.dataset_key == ds.filename %} selected{% endif %}>{{ ds.short_path }}{% if ds.is_readonly %} (ro){% endif %}</option>
+          {% endfor %}
+        </select>
+
+        <div class="btn-group btn-group-sm my-2 compare-source-toggle" role="group">
+          <input type="radio" class="btn-check" name="{{ side }}_source" id="{{ side }}-source-table" value="table" autocomplete="off"{% if spec.source_type != 'query' %} checked{% endif %} />
+          <label class="btn btn-outline-secondary" for="{{ side }}-source-table">Table</label>
+          <input type="radio" class="btn-check" name="{{ side }}_source" id="{{ side }}-source-query" value="query" autocomplete="off"{% if spec.source_type == 'query' %} checked{% endif %} />
+          <label class="btn btn-outline-secondary" for="{{ side }}-source-query">Query</label>
+        </div>
+
+        <div class="compare-table-row">
+          <label for="{{ side }}-table">Table</label>
+          <select class="form-control form-control-sm compare-table" id="{{ side }}-table" name="{{ side }}_table" disabled>
+            <option value="">—</option>
+          </select>
+        </div>
+        <div class="compare-query-row">
+          <label for="{{ side }}-sql">Query (single SELECT)</label>
+          <textarea class="form-control form-control-sm compare-sql" id="{{ side }}-sql" name="{{ side }}_sql" rows="3" placeholder="SELECT ...">{{ spec.sql }}</textarea>
+        </div>
+        <div class="small text-danger compare-side-error" style="display:none;"></div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="form-group">
+    <label>Key columns <small class="text-muted">(must exist on both sides; identify the same row)</small></label>
+    <div id="compare-keys" class="compare-keys">
+      <small class="text-muted">Choose both sides first.</small>
+    </div>
+  </div>
+
+  <button class="btn btn-primary" type="submit">Compare</button>
+</form>
+
+<hr />
+<div id="compare-results" aria-live="polite">
+  {% if submitted %}
+    {% include "compare_results.html" %}
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+  <script src="{{ url_for('static', filename='js/compare.js') }}" type="text/javascript"></script>
+  <script type="text/javascript">
+    $(function() {
+      App.Compare.initialize({
+        columnsUrl: {{ url_for('compare_columns')|tojson }},
+        compareUrl: {{ url_for('compare')|tojson }},
+        tables: {
+          {% for ds_key, names in tables_map.items() %}
+            {{ ds_key|tojson }}: {{ names|tojson }}{% if not loop.last %},{% endif %}
+          {% endfor %}
+        },
+        selectedKeys: {{ key_columns|tojson }},
+        submitted: {{ submitted|tojson }}
+      });
+    });
+  </script>
+{% endblock %}
